@@ -1,0 +1,754 @@
+---
+title: "Cancer Prediction"
+author: "Qinglan Ouyang"
+format: html
+editor: visual
+---
+```{r}
+library(reticulate)
+
+# 安装 CatBoost
+reticulate::py_install("catboost", pip = TRUE)
+
+# 检查是否安装成功
+reticulate::py_module_available("catboost")  # 返回 TRUE 表示成功
+```
+
+```{r}
+# 加载包
+library(tidyverse)
+library(caret)        # 用于模型训练和交叉验证
+library(e1071)        # 用于SVM和Naive Bayes
+library(pROC)         # 用于ROC曲线和AUC
+library(doParallel)   # 用于并行处理 (可选，加速CV)
+library(RColorBrewer) # 用于自定义颜色
+# 加载集成模型包
+library(xgboost)
+library(lightgbm)
+library(reticulate)
+catboost <- import("catboost")
+```
+
+```{r}
+# loaing 
+df <- read.csv("C:/Users/ouyan/OneDrive/文档/BIOSTAT625/The_Cancer_data_1500_V2.csv")
+summary(df)
+print(head(df))
+```
+```{r}
+colSums(is.na(df))
+```
+
+```{r}
+library(tidyverse)
+df <- df %>%
+  mutate(
+    Gender = factor(as.character(Gender), 
+                    levels = c("0", "1"), 
+                    labels = c("Male","Female")),
+    
+    Smoking = factor(as.character(Smoking), 
+                     levels = c("0", "1"), 
+                     labels = c("No","Yes")),
+    
+    CancerHistory = factor(as.character(CancerHistory), 
+                           levels = c("0", "1"), 
+                           labels = c("No","Yes")),
+    
+    GeneticRisk = factor(as.character(GeneticRisk),
+                         levels = c("0","1","2"),
+                         labels = c("Low","Medium","High")),
+    
+    Diagnosis = factor(as.character(Diagnosis),
+                       levels = c("0","1"),
+                       labels = c("NoCancer","Cancer"))
+  )
+
+print(head(df))
+```
+
+```{r}
+continuous_vars <- c("Age","BMI","PhysicalActivity","AlcoholIntake")
+binary_vars <- c("Gender","Smoking","CancerHistory")
+categorical_vars <- c("GeneticRisk")
+target_var <- "Diagnosis"
+```
+
+```{r}
+# 定义用于划分和缩放的变量（确保这些变量已在你前面的代码中定义）
+# continuous_vars <- c("Age","BMI","PhysicalActivity","AlcoholIntake")
+# target_var <- "Diagnosis" # 假设这是你的目标变量
+
+# 从你已经进行了因子转换的原始 df 开始
+df_for_modeling <- df # 假设 'df' 是完成了因子转换后的数据框
+
+# --- 1. 分割 X 和 y ---
+X <- df_for_modeling %>% select(-all_of(target_var))
+y <- df_for_modeling[[target_var]]
+
+# --- 2. 划分训练集和测试集 (80/20 stratified split) ---
+set.seed(42)
+# 使用目标变量 y 进行分层抽样
+train_index <- createDataPartition(y, p = 0.8, list = FALSE)
+
+X_train <- X[train_index, ]
+X_test <- X[-train_index, ]
+y_train <- y[train_index]
+y_test <- y[-train_index]
+
+
+# --- 3. 标准化 (仅在训练集上学习参数) ---
+# 构建预处理步骤：仅对训练集的连续特征进行标准化 (fit)
+preprocessor <- preProcess(X_train[, continuous_vars], method = c("center", "scale"))
+
+# 应用预处理：将训练集和测试集进行转换 (transform)
+X_train_processed <- predict(preprocessor, X_train)
+X_test_processed <- predict(preprocessor, X_test)
+
+
+# --- 4. 创建最终的训练/测试数据集 (合并 X 和 y) ---
+# 注意：X_train_processed 已经包含了所有因子变量
+train_data <- cbind(Diagnosis = y_train, X_train_processed)
+test_data <- cbind(Diagnosis = y_test, X_test_processed)
+
+# 最终检查：确保目标变量是两级因子（前面已完成，但这一步保证了数据完整性）
+train_data$Diagnosis <- factor(train_data$Diagnosis, levels = c("NoCancer", "Cancer"))
+test_data$Diagnosis <- factor(test_data$Diagnosis, levels = c("NoCancer", "Cancer"))
+
+# 现在 train_data 和 test_data 已经准备好用于模型训练
+cat("数据划分和标准化已完成，准备进入模型训练阶段。\n")
+```
+
+```{r}
+# 1. 定义交叉验证参数 (5-Fold Stratified CV)
+control <- trainControl(
+  method = "cv",
+  number = 5,
+  classProbs = TRUE,       # Accuracy 不依赖概率，可保留
+  summaryFunction = defaultSummary,  # 改为默认 summary，这样会输出 Accuracy
+  savePredictions = "final",
+  verboseIter = FALSE
+)
+
+
+# 2. 定义模型列表（使用caret支持的模型名称）
+# 映射：Python名称 -> R caret 名称
+# Logistic Regression -> glm (广义线性模型)
+# Decision Tree -> rpart
+# Random Forest -> rf
+# Gradient Boosting -> gbm
+# SVM -> svmRadial (径向核SVM)
+# k-NN -> knn
+# Naive Bayes -> nb
+# LightGBM -> gbm (需要特殊设置或使用专用包)
+# CatBoost -> catboost (需要使用专用包)
+
+models_to_run <- c("glm", "rpart", "rf", "gbm", "svmRadial", "knn", "nb")
+results_cv <- list()
+
+# 3. 运行交叉验证
+# 注册并行后端（可选）
+if (requireNamespace("doParallel", quietly = TRUE)) {
+  cl <- makePSOCKcluster(detectCores() - 1)
+  registerDoParallel(cl)
+}
+
+# 循环训练模型
+for (model_name in models_to_run) {
+  cat(paste("Training model:", model_name, "...\n"))
+  
+  # Rpart (决策树) 的调参网格
+  if (model_name == "rpart") {
+    tune_grid <- expand.grid(cp = seq(0.01, 0.1, 0.01))
+  } else {
+    tune_grid <- NULL # 使用默认调参网格
+  }
+  
+  # 训练模型
+  model_fit <- train(
+    Diagnosis ~ .,
+    data = train_data,
+    method = model_name,
+    trControl = control,
+    metric = "Accuracy", # 使用准确率作为选择指标
+    tuneGrid = tune_grid
+  )
+  
+  results_cv[[model_name]] <- model_fit
+  
+  # 打印结果
+  print(model_fit$results[order(model_fit$results$Accuracy, decreasing = TRUE), ][1, ])
+}
+
+# 停止并行后端（如果已注册）
+if (exists("cl")) {
+  stopCluster(cl)
+  registerDoSEQ()
+}
+
+# 4. 汇总和选择最佳模型
+results_summary <- data.frame(
+    Model = character(),
+    CV_Accuracy_Mean = numeric(),
+    CV_Accuracy_Std = numeric(), # 修正此处的列名
+    stringsAsFactors = FALSE
+)
+
+for (name in names(results_cv)) {
+    best_tune <- results_cv[[name]]$results[order(results_cv[[name]]$results$Accuracy, decreasing = TRUE), ][1, ]
+    results_summary <- results_summary %>%
+        add_row(
+            Model = name,
+            CV_Accuracy_Mean = best_tune$Accuracy,
+            CV_Accuracy_Std = best_tune$AccuracySD #关键修正：使用 AccuracySD
+        )
+}
+
+# 3. 打印 CV 汇总
+print("=== Cross-Validation Results ===")
+print(results_summary)
+
+# 4. 选择最佳模型（Accuracy 最大）
+best_model_name <- results_summary$Model[which.max(results_summary$CV_Accuracy_Mean)]
+best_model <- results_cv[[best_model_name]]
+cat(paste("\nBest model:", best_model_name, "with mean CV Accuracy=",
+          max(results_summary$CV_Accuracy_Mean), "\n"))
+
+```
+
+
+```{R}
+# 1. 测试集评估
+test_results_list <- list()
+
+for (model_name in names(results_cv)) {
+  model_fit <- results_cv[[model_name]]
+  
+  # 预测
+  y_pred <- predict(model_fit, newdata = test_data)
+  
+  # 计算混淆矩阵
+  cm <- confusionMatrix(y_pred, test_data$Diagnosis, positive = "Cancer")
+  
+  # 提取指标
+  acc <- cm$overall['Accuracy']
+  prec <- cm$byClass['Pos Pred Value'] # Precision
+  rec <- cm$byClass['Recall']         # Recall
+  f1 <- cm$byClass['F1']
+  
+  test_results_list[[model_name]] <- data.frame(
+    Model = model_name,
+    Test_Accuracy = acc,
+    Test_Precision = prec,
+    Test_Recall = rec,
+    Test_F1 = f1
+  )
+  
+  # 打印混淆矩阵（对应Python中的 ConfusionMatrixDisplay plot）
+  if (model_name == best_model_name) {
+    cat(paste("\n=== Confusion Matrix -", model_name, "===\n"))
+    print(cm$table)
+    
+    # 混淆矩阵可视化
+    cm_df <- as.data.frame(cm$table)
+    
+    # 使用 ggplot2 绘制热图形式的混淆矩阵 
+    ggplot(cm_df, aes(x = Prediction, y = Reference, fill = Freq)) +
+      geom_tile(color = "white") +
+      scale_fill_gradient(low = "white", high = "#336699") +
+      geom_text(aes(label = Freq), vjust = 1, fontface = "bold", size = 5) +
+      labs(title = paste("Confusion Matrix -", model_name),
+           x = "Predicted Label", y = "True Label") +
+      theme_minimal() +
+      theme(plot.title = element_text(face = "bold", size = 14), legend.position = "none")
+  }
+}
+
+# 2. 汇总测试结果
+test_results_df <- do.call(rbind, test_results_list)
+
+print("\n=== Test Set Results ===")
+print(test_results_df)
+
+# 3. 保存结果
+#write.csv(results_summary, 'cross_validation_results_R.csv', row.names = FALSE)
+#write.csv(test_results_df, 'test_set_results_R.csv', row.names = FALSE)
+#cat("\nResults saved to 'cross_validation_results_R.csv' and 'test_set_results_R.csv'.\n")
+```
+```{r}
+library(dplyr)
+
+df %>%
+  group_by(Diagnosis) %>%
+  summarise(
+    Count = n(),
+    Percentage = n() / nrow(df) * 100
+  ) %>%
+  ungroup() %>%
+  mutate(
+    # 格式化百分比为两位小数
+    Percentage_Formatted = paste0(round(Percentage, 2), "%")
+  )
+```
+```{r}
+set.seed(42)
+
+K <- 5
+folds <- createFolds(train_data$Diagnosis, k = K, list = TRUE)
+
+# 用来存放 OOF stacking 特征
+oof_rf_prob  <- rep(NA, nrow(train_data))
+oof_gbm_prob <- rep(NA, nrow(train_data))
+
+# 5-fold stacking
+for (i in 1:K) {
+  cat("Processing fold", i, "\n")
+  
+  idx_valid <- folds[[i]]
+  idx_train <- setdiff(seq_len(nrow(train_data)), idx_valid)
+  
+  train_fold <- train_data[idx_train, ]
+  valid_fold <- train_data[idx_valid, ]
+  
+  # RF
+  rf_model <- train(
+    Diagnosis ~ ., data = train_fold, method = "rf",
+    trControl = trainControl(method = "cv", number = 3),
+    tuneLength = 5
+  )
+  
+  # GBM
+  gbm_model <- train(
+    Diagnosis ~ ., data = train_fold, method = "gbm",
+    trControl = trainControl(method = "cv", number = 3),
+    verbose = FALSE
+  )
+  
+  # OOF predictions
+  oof_rf_prob[idx_valid]  <- predict(rf_model,  valid_fold, type = "prob")[, "Cancer"]
+  oof_gbm_prob[idx_valid] <- predict(gbm_model, valid_fold, type = "prob")[, "Cancer"]
+}
+
+# 生成无泄漏 stacked 特征
+stacked_train <- data.frame(
+  rf_prob  = oof_rf_prob,
+  gbm_prob = oof_gbm_prob,
+  y = as.numeric(train_data$Diagnosis == "Cancer")
+)
+
+```
+
+```{r}
+X_stack <- as.matrix(stacked_train[, c("rf_prob", "gbm_prob")])
+y_stack <- stacked_train$y
+
+stack_lr <- cv.glmnet(
+  X_stack, y_stack,
+  family = "binomial",
+  alpha = 1,       # LASSO: prevent over fitting
+  nfolds = 5
+)
+
+cat("Selected lambda:", stack_lr$lambda.min, "\n")
+coef(stack_lr, s = "lambda.min")
+
+```
+
+```{r}
+rf_full <- train(
+  Diagnosis ~ ., data = train_data, method = "rf",
+  trControl = trainControl(method = "none"),
+  tuneGrid = data.frame(mtry = floor(sqrt(ncol(train_data) - 1))),
+  ntree = 500
+)
+
+gbm_full <- train(
+  Diagnosis ~ ., data = train_data, method = "gbm",
+  trControl = trainControl(method = "none"),
+  verbose = FALSE,
+  tuneGrid = data.frame(
+    n.trees = 200,
+    interaction.depth = 3,
+    shrinkage = 0.05,
+    n.minobsinnode = 10
+  )
+)
+
+
+```
+
+```{r}
+rf_test_prob  <- predict(rf_full, newdata = test_data, type = "prob")[, "Cancer"]
+gbm_test_prob <- predict(gbm_full, newdata = test_data, type = "prob")[, "Cancer"]
+
+stacked_test <- as.matrix(data.frame(
+  rf_prob  = rf_test_prob,
+  gbm_prob = gbm_test_prob
+))
+
+final_probs <- predict(stack_lr, newx = stacked_test, s = "lambda.min", type = "response")
+final_pred  <- ifelse(final_probs > 0.5, "Cancer", "NoCancer")
+final_pred  <- factor(final_pred, levels = c("NoCancer","Cancer"))
+
+```
+
+```{r}
+# Confusion Matrix
+confusionMatrix(final_pred, test_data$Diagnosis)
+
+# Convert matrix into vector
+train_pred_vector <- as.numeric(train_pred[, 1])  # 提取第一列并转为 numeric 向量
+final_probs_vector <- as.numeric(final_probs[, 1])
+
+# ROC curve
+roc_curve <- roc(test_data$Diagnosis, final_probs_vector)
+auc(roc_curve)
+
+library(MLmetrics)
+# 将 factor 转成 numeric (1 = Cancer, 0 = NoCancer)
+y_true <- ifelse(test_data$Diagnosis == "Cancer", 1, 0)
+y_pred <- ifelse(final_pred == "Cancer", 1, 0)
+
+Precision <- Precision(y_pred, y_true)
+Recall    <- Recall(y_pred, y_true)
+F1        <- F1_Score(y_pred, y_true)
+
+cat("Precision:", Precision, "\n")
+cat("Recall:", Recall, "\n")
+cat("F1 Score:", F1, "\n")
+
+```
+
+```{r}
+# (i) Evaluate over fitting
+train_pred <- predict(stack_lr, newx = X_stack, s = "lambda.min", type = "response")
+
+auc_train <- auc(roc(train_data$Diagnosis, train_pred_vector))
+auc_test  <- auc(roc(test_data$Diagnosis, final_probs_vector))
+
+cat("Train AUC:", auc_train, "\n")
+cat("Test  AUC:", auc_test, "\n")
+cat("Gap =", auc_train - auc_test, "\n")
+```
+```{r}
+# 1. 确保 Stacked Train Vector 已转换
+# train_pred <- predict(stack_lr, newx = X_stack, s = "lambda.min", type = "response")
+# train_pred_vector <- as.numeric(train_pred[, 1]) 
+
+# 2. 获取 GLM 在测试集上的概率预测
+glm_model <- results_cv[["glm"]]
+glm_test_probs <- predict(glm_model, newdata = test_data, type = "prob")[, "Cancer"]
+
+# 3. 计算 GLM 的 ROC 曲线
+roc_glm <- roc(test_data$Diagnosis, glm_test_probs)
+
+# --- 绘图 ---
+# 绘制 Stacked Train ROC (作为基础图)
+plot(roc(train_data$Diagnosis, train_pred_vector), 
+     col = "blue", 
+     main = "Stacked vs. Logistic Regression ROC Comparison",
+     # 设置 y 轴和 x 轴标签
+     xlab = "False Positive Rate (1 - Specificity)",
+     ylab = "True Positive Rate (Sensitivity)") 
+
+# 叠加 Stacked Test ROC
+plot(roc(test_data$Diagnosis, final_probs_vector), 
+     col = "red", 
+     add = TRUE)
+
+# 叠加 GLM Test ROC
+plot(roc_glm, 
+     col = "purple", 
+     add = TRUE)
+
+# 4. 添加图例和随机猜测线
+abline(a = 0, b = 1, lty = 2, col = "gray") # 随机猜测线
+
+legend("bottomright", 
+       legend = c(
+         paste("Stacked Train AUC:", round(auc(roc(train_data$Diagnosis, train_pred_vector)), 4)),
+         paste("Stacked Test AUC:", round(auc(roc(test_data$Diagnosis, final_probs_vector)), 4)),
+         paste("Logistic Regression Test AUC:", round(auc(roc_glm), 4))
+       ),
+       col = c("blue", "red", "purple"), 
+       lwd = 2)
+
+cat("\nLogistic Regression Test AUC:", auc(roc_glm), "\n")
+```
+
+```{r}
+# (ii) Evaluate the stratified split
+prop.table(table(train_data$Diagnosis))
+prop.table(table(test_data$Diagnosis))
+```
+
+```{r}
+library(ggplot2)
+
+ggplot(train_data, aes(x = Diagnosis)) +
+  geom_bar(aes(y = (..count..)/sum(..count..)), fill = "steelblue") +
+  geom_text(aes(y = (..count..)/sum(..count..), label = scales::percent((..count..)/sum(..count..))),
+            stat = "count", vjust = -0.5) +
+  ylab("Proportion") +
+  ggtitle("Training Set Class Distribution") +
+  theme_minimal()
+
+ggplot(test_data, aes(x = Diagnosis)) +
+  geom_bar(aes(y = (..count..)/sum(..count..)), fill = "steelblue") +
+  geom_text(aes(y = (..count..)/sum(..count..), label = scales::percent((..count..)/sum(..count..))),
+            stat = "count", vjust = -0.5) +
+  ylab("Proportion") +
+  ggtitle("Testing Set Class Distribution") +
+  theme_minimal()
+```
+
+```{r}
+# 3. (iii) Calibration Plot
+# 创建数据框
+df_calib <- data.frame(
+  prob = final_probs_vector,
+  true = y_true
+)
+
+# 2. 将预测概率分组
+n_bins <- 6
+df_calib$bin <- cut(df_calib$prob, breaks = seq(0,1,length.out = n_bins+1), include.lowest = TRUE)
+
+calib_summary <- df_calib %>%
+  group_by(bin) %>%
+  summarise(
+    mean_pred = mean(prob),
+    obs_rate  = mean(true),
+    n         = n()
+  )
+
+# 3. 绘制校准曲线
+ggplot(calib_summary, aes(x = mean_pred, y = obs_rate)) +
+  geom_point(aes(size = n), color = "blue") +             # 每个 bin 点大小按样本数
+  geom_line(color = "blue") +
+  # 3. 添加文本标签：显示每个点的样本量 n
+  # vjust/hjust 用于微调文本位置，使其不与点重叠
+  geom_text(aes(label = n), vjust = -1.5, hjust = 0.5, size = 3.5, color = "black") +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "red") +
+  xlim(0, 1) + ylim(0, 1) +
+  xlab("Mean Predicted Probability") +
+  ylab("Observed Event Rate") +
+  ggtitle("Stacked Logistic Regression Calibration Plot") +
+  theme_minimal() +
+  scale_size_continuous(name = "Samples per bin")
+
+# 4. Calculate Brier Score
+brier_score <- mean((final_probs_vector - y_true)^2)
+cat("Brier Score:", round(brier_score, 4), "\n")
+```
+
+```{r}
+# (iv) Evaluate feature importance / Explainability（模型可解释性）
+# rf 特征重要性
+rf_imp <- varImp(rf_full)$importance
+rf_imp %>% arrange(desc(Overall)) 
+
+# GBM 特征重要性
+gbm_imp <- summary(gbm_full$finalModel, n.trees = gbm_full$bestTune$n.trees, plotit = FALSE)
+print(gbm_imp)
+
+coef(stacked_lr, s = "lambda.min")  # 查看各 base model 概率的权重
+```
+```{r}
+library(dplyr)
+library(tidyr)
+
+rf_data <- data.frame(
+  Feature = c("CancerHistoryYes", "BMI", "AlcoholIntake", "GeneticRiskHigh", "PhysicalActivity", 
+              "Age", "GenderFemale", "SmokingYes", "GeneticRiskMedium"),
+  RF_Importance = c(100.00, 83.93, 80.48, 79.50, 75.92, 74.19, 42.45, 26.35, 0.00)
+)
+
+# --- 模拟您提供的 GBM 数据 ---
+gbm_data <- data.frame(
+  Feature = c("CancerHistoryYes", "GeneticRiskHigh", "AlcoholIntake", "GenderFemale", "BMI", 
+              "PhysicalActivity", "Age", "SmokingYes", "GeneticRiskMedium"),
+  GBM_Importance = c(20.91, 17.86, 11.10, 10.91, 10.69, 10.60, 10.52, 7.34, 0.08)
+)
+
+# --- 统一格式和合并 ---
+combined_imp <- full_join(rf_data, gbm_data, by = "Feature") %>%
+  # 简化/统一特征名称
+  mutate(
+    Feature_Clean = case_when(
+      grepl("CancerHistory", Feature) ~ "Cancer History (Yes)",
+      grepl("GeneticRiskHigh", Feature) ~ "Genetic Risk (High)",
+      grepl("GenderFemale", Feature) ~ "Gender (Female)",
+      grepl("SmokingYes", Feature) ~ "Smoking (Yes)",
+      grepl("GeneticRiskMedium", Feature) ~ "Genetic Risk (Medium)",
+      TRUE ~ Feature # 保留其他变量原名
+    )
+  ) %>%
+  select(Feature_Clean, RF_Importance, GBM_Importance) %>%
+  arrange(desc(RF_Importance)) # 以 RF 重要性作为主排序
+
+# 打印最终结果
+print(combined_imp)
+```
+```{r}
+# 定义一个函数，用于计算 Stacked 模型的最终概率
+stacked_predict_prob <- function(object, newdata) {
+  # 1. Base Learner Predictions
+  rf_test_prob <- predict(rf_full, newdata = newdata, type = "prob")[, "Cancer"]
+  gbm_test_prob <- predict(gbm_full, newdata = newdata, type = "prob")[, "Cancer"]
+# ⚠️ Sanity Check 1: 检查 Base Learner 预测长度是否匹配输入
+  if (length(rf_test_prob) != nrow(newdata) || length(gbm_test_prob) != nrow(newdata)) {
+  warning("Sanity Check Failed: Base Learner prediction length does not match input data rows. Check for    
+  NA/missing rows due to new factor levels.")
+  # 理想情况下，应该停止执行
+  # stop("Inconsistent prediction length detected.") 
+}
+  # 2. Create Stacked Feature Matrix (Level 1)
+  if (any(is.na(rf_test_prob)) || any(is.na(gbm_test_prob))) {
+  warning("Sanity Check Failed: Base Learner probabilities contain NA values.")
+}
+  stacked_test <- as.matrix(data.frame(
+    rf_prob  = rf_test_prob,
+    gbm_prob = gbm_test_prob
+  ))
+  
+  # 3. Final Prediction using Meta Learner
+  final_probs <- predict(stack_lr, newx = stacked_test, s = "lambda.min", type = "response")
+  # ⚠️ Sanity Check 2: 检查最终概率是否有效
+  if (any(final_probs < 0) || any(final_probs > 1) || any(is.na(final_probs))) {
+  warning("Sanity Check Failed: Final probabilities contain values outside [0, 1] or contain NA.")
+  # stop("Invalid probability detected.")
+}
+  
+  # 返回概率向量
+  return(as.numeric(final_probs))
+}
+```
+
+```{r}
+library(iml)
+# --- 1. 创建 Stacked 模型的解释器对象 ---
+# 传入一个占位符模型 (rf_full) 作为 model，但关键是传递自定义预测函数
+predictor_stacked <- Predictor$new(
+  # model = rf_full, # 占位符
+  data = train_data[,-which(names(train_data)=="Diagnosis")],
+  y = train_data$Diagnosis,
+  predict.function = stacked_predict_prob, # 关键：指定 Stacked 预测函数
+  class = "Cancer" # 明确指定要解释的类别
+)
+
+# --- 2. 选取要解释的样本 (测试集第 50 个样本) ---
+x_interest_test_sample <- test_data[50, -which(names(test_data)=="Diagnosis")]
+
+# --- 3. 计算 Stacked 模型的 SHAP 值 ---
+shapley_stacked <- Shapley$new(
+  predictor = predictor_stacked,
+  x.interest = x_interest_test_sample
+)
+
+# --- 4. 绘图 ---
+shapley_stacked$plot()
+```
+```{r}
+# Sanity check
+# 1. 创建一个测试数据框 (例如，使用训练集的前 10 行)
+test_data_sample <- train_data[1:10, -which(names(train_data) == "Diagnosis")]
+
+# 2. 运行你的 Stacked 预测函数
+test_probs <- stacked_predict_prob(object = rf_full, newdata = test_data_sample)
+
+# 3. 严格检查最大值
+max_prob <- max(test_probs, na.rm = TRUE)
+min_prob <- min(test_probs, na.rm = TRUE)
+
+print(paste("Maximum calculated probability:", max_prob))
+print(paste("Minimum calculated probability:", min_prob))
+```
+```{r}
+library(iml)
+library(ggplot2)
+# Validated that our stacked logistic regression has learned non-linear relationship
+# --- 1. 使用 iml::FeatureEffect 计算 PDP 数据 ---
+# method = "pdp" 是偏依赖图
+effect_bmi <- FeatureEffect$new(
+    predictor = predictor_stacked, 
+    feature = "BMI", 
+    method = "pdp"
+)
+
+# --- 2. 绘制 PDP 图 ---
+# iml 的 plot() 方法会自动处理 PDP 的标签和尺度
+# 确保 y 轴在 0 到 1 之间
+plot_pdp_bmi <- effect_bmi$plot() + 
+    labs(title = "Stacked Model PDP (BMI)", 
+         y = "Predicted Cancer Probability (0-1)") +
+    theme_minimal()
+
+print(plot_pdp_bmi)
+
+# AlcholIntake plot
+effect_alch <- FeatureEffect$new(
+    predictor = predictor_stacked, 
+    feature = "AlcoholIntake", 
+    method = "pdp"
+)
+
+plot_pdp_alch <- effect_alch$plot() + 
+    labs(title = "Stacked Model PDP (AlcoholIntake)", 
+         y = "Predicted Cancer Probability (0-1)") +
+    theme_minimal()
+
+print(plot_pdp_alch)
+```
+
+```{r}
+# (v) Deviance and QQ-plot as diagnosis
+# --- 1. 准备训练集预测概率 ---
+X_train_stack <- as.matrix(data.frame(
+  rf_prob  = predict(rf_full, newdata = train_data, type = "prob")[, "Cancer"],
+  gbm_prob = predict(gbm_full, newdata = train_data, type = "prob")[, "Cancer"]
+))
+y_train <- ifelse(train_data$Diagnosis == "Cancer", 1, 0)
+
+train_pred_prob <- as.vector(predict(stack_lr, newx = X_train_stack, s = "lambda.min", type = "response"))
+# --- 2. 计算残差 ---
+# Deviance residuals
+dev_resid <- ifelse(y_train == 1,
+                    sqrt(-2 * log(train_pred_prob)),
+                    -sqrt(-2 * log(1 - train_pred_prob)))
+
+# Standardized residuals
+std_resid <- scale(dev_resid)
+
+# --- 2. 偏差残差 vs 拟合值图 (Residuals vs Fitted) ---
+# 检查残差是否随机分布在 0 附近
+residual_data <- data.frame(Fitted = train_pred_prob, DevianceResid = dev_resid)
+
+plot_resid_fitted <- ggplot(residual_data, aes(x = Fitted, y = DevianceResid)) +
+  geom_point(alpha = 0.5, color = "#1E88E5") + # 蓝色散点
+  geom_smooth(method = "loess", color = "darkorange", se = FALSE, linetype = "solid") + # 添加平滑曲线
+  geom_hline(yintercept = 0, color = "red", linetype = "dashed", size = 1) +
+  labs(title = "Stacked Model: Deviance Residuals vs Fitted Probabilities",
+       x = "Fitted Probabilities",
+       y = "Deviance Residuals") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+
+print(plot_resid_fitted)
+
+
+# --- 3. 标准化残差 Q-Q Plot ---
+# 检查偏差残差是否近似正态分布
+qq_data <- data.frame(StdResid = std_resid)
+
+plot_qq <- ggplot(qq_data, aes(sample = StdResid)) +
+  stat_qq(alpha = 0.6, color = "#2E7D32") + # 绿色散点
+  stat_qq_line(color = "red", linetype = "dashed", size = 1) +
+  labs(title = "Stacked Model: Q-Q Plot of Standardized Deviance Residuals",
+       x = "Theoretical Quantiles",
+       y = "Sample Quantiles") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+
+print(plot_qq)
+```

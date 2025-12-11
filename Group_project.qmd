@@ -5,16 +5,6 @@ format: html
 editor: visual
 ---
 ```{r}
-library(reticulate)
-
-# 安装 CatBoost
-reticulate::py_install("catboost", pip = TRUE)
-
-# 检查是否安装成功
-reticulate::py_module_available("catboost")  # 返回 TRUE 表示成功
-```
-
-```{r}
 # 加载包
 library(tidyverse)
 library(caret)        # 用于模型训练和交叉验证
@@ -26,7 +16,6 @@ library(RColorBrewer) # 用于自定义颜色
 library(xgboost)
 library(lightgbm)
 library(reticulate)
-catboost <- import("catboost")
 ```
 
 ```{r}
@@ -339,6 +328,7 @@ stacked_train <- data.frame(
 ```
 
 ```{r}
+library(glmnet)
 X_stack <- as.matrix(stacked_train[, c("rf_prob", "gbm_prob")])
 y_stack <- stacked_train$y
 
@@ -396,6 +386,7 @@ final_pred  <- factor(final_pred, levels = c("NoCancer","Cancer"))
 # Confusion Matrix
 confusionMatrix(final_pred, test_data$Diagnosis)
 
+train_pred <- predict(stack_lr, newx = X_stack, s = "lambda.min", type = "response")
 # Convert matrix into vector
 train_pred_vector <- as.numeric(train_pred[, 1])  # 提取第一列并转为 numeric 向量
 final_probs_vector <- as.numeric(final_probs[, 1])
@@ -552,7 +543,7 @@ rf_imp %>% arrange(desc(Overall))
 gbm_imp <- summary(gbm_full$finalModel, n.trees = gbm_full$bestTune$n.trees, plotit = FALSE)
 print(gbm_imp)
 
-coef(stacked_lr, s = "lambda.min")  # 查看各 base model 概率的权重
+coef(stack_lr, s = "lambda.min")  # 查看各 base model 概率的权重
 ```
 ```{r}
 library(dplyr)

@@ -1,0 +1,954 @@
+---
+title: "Stacked Model Predicting Cancer (source code of report)"
+author: "Qinglan Ouyang"
+date: "2025-12-12"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+# library loading
+library(tidyverse)
+library(caret)        # model training and cross-validation
+library(e1071)        # SVM and Naive Bayes
+library(pROC)         # ROC curve and AUC
+library(doParallel)   # parallel computing
+library(RColorBrewer) # color
+library(xgboost)
+library(lightgbm)
+library(reticulate)
+```
+
+## Data loading and data cleaning
+```{r}
+# loaing 
+df <- read.csv("C:/Users/ouyan/OneDrive/文档/BIOSTAT625/The_Cancer_data_1500_V2.csv")
+summary(df)
+print(head(df))
+```
+
+```{r}
+colSums(is.na(df))
+```
+
+```{r}
+library(tidyverse)
+df <- df %>%
+  mutate(
+    Gender = factor(as.character(Gender), 
+                    levels = c("0", "1"), 
+                    labels = c("Male","Female")),
+    
+    Smoking = factor(as.character(Smoking), 
+                     levels = c("0", "1"), 
+                     labels = c("No","Yes")),
+    
+    CancerHistory = factor(as.character(CancerHistory), 
+                           levels = c("0", "1"), 
+                           labels = c("No","Yes")),
+    
+    GeneticRisk = factor(as.character(GeneticRisk),
+                         levels = c("0","1","2"),
+                         labels = c("Low","Medium","High")),
+    
+    Diagnosis = factor(as.character(Diagnosis),
+                       levels = c("0","1"),
+                       labels = c("NoCancer","Cancer"))
+  )
+print(head(df))
+```
+
+```{r}
+continuous_vars <- c("Age","BMI","PhysicalActivity","AlcoholIntake")
+binary_vars <- c("Gender","Smoking","CancerHistory")
+categorical_vars <- c("GeneticRisk")
+target_var <- "Diagnosis"
+```
+
+### Variable visualization
+```{r}
+df %>%
+  pivot_longer(all_of(continuous_vars)) %>%
+  ggplot(aes(x = value)) +
+  geom_histogram(bins = 30, fill = "#6baed6", color = "black") +
+  facet_wrap(~ name, scales = "free") +
+  theme_minimal() +
+  labs(title = "Distribution of Continuous Variables")
+```
+
+```{r}
+df %>%
+  pivot_longer(all_of(continuous_vars)) %>%
+  ggplot(aes(x = name, y = value)) +
+  geom_boxplot(fill = "#9ecae1") +
+  theme_minimal() +
+  labs(title = "Boxplots of Continuous Variables")
+```
+
+```{r}
+library(corrplot)
+df_corr <- df %>%
+  mutate(Diagnosis_num = ifelse(Diagnosis == "Cancer", 1, 0)) %>%
+  select(all_of(continuous_vars), Diagnosis_num)
+
+corrplot(cor(df_corr), method = "color", addCoef.col = "black")
+```
+
+```{r}
+df %>%
+  select(all_of(c(binary_vars, categorical_vars))) %>%
+  pivot_longer(everything()) %>%
+  ggplot(aes(x = value)) +
+  geom_bar(fill = "#fd8d3c") +
+  facet_wrap(~ name, scales = "free") +
+  theme_minimal() +
+  labs(title = "Distribution of Binary and Categorical Variables")
+```
+
+```{r}
+df %>%
+  pivot_longer(continuous_vars) %>%
+  ggplot(aes(x = Diagnosis, y = value, fill = Diagnosis)) +
+  geom_boxplot() +
+  facet_wrap(~ name, scales = "free") +
+  theme_minimal() +
+  labs(title = "Continuous Variables by Cancer Status")
+```
+
+```{r}
+# check whether the data balance
+df %>% ggplot(aes(x = Diagnosis, fill = Diagnosis)) +
+  geom_bar() +
+  theme_minimal() +
+  labs(title = "Cancer vs Non-Cancer Distribution")
+```
+
+## Split training and testing sets
+```{r}
+df_for_modeling <- df 
+
+# --- 1. Split X and y ---
+X <- df_for_modeling %>% select(-all_of(target_var))
+y <- df_for_modeling[[target_var]]
+
+# --- 2. Spli training and testing sets (80/20 stratified split) ---
+set.seed(42)
+# Use the target variable y for stratified sampling
+train_index <- createDataPartition(y, p = 0.8, list = FALSE)
+
+X_train <- X[train_index, ]
+X_test <- X[-train_index, ]
+y_train <- y[train_index]
+y_test <- y[-train_index]
+
+
+# --- 3. Standardization (Learn parameters only on the training set) ---
+# Build preprocessing steps: Fit the standardization parameters on continuous features of the training set only
+preprocessor <- preProcess(X_train[, continuous_vars], method = c("center", "scale"))
+
+# Apply preprocessing: Transform both the training and testing sets
+X_train_processed <- predict(preprocessor, X_train)
+X_test_processed <- predict(preprocessor, X_test)
+
+
+# --- 4. 4. Create final training/testing datasets (Combine X and y) ---
+# Note: X_train_processed already includes all factor variables
+train_data <- cbind(Diagnosis = y_train, X_train_processed)
+test_data <- cbind(Diagnosis = y_test, X_test_processed)
+
+# Final check: Ensure the target variable is a two-level factor (already done, but this ensures data integrity)
+train_data$Diagnosis <- factor(train_data$Diagnosis, levels = c("NoCancer", "Cancer"))
+test_data$Diagnosis <- factor(test_data$Diagnosis, levels = c("NoCancer", "Cancer"))
+
+# The train_data and test_data are now ready for model training
+cat("Data splitting and standardization are complete, ready to proceed to the model training stage.\n")
+```
+
+## Model fitting
+```{r}
+# 1. Define 5-Fold Stratified CV function
+control <- trainControl(
+  method = "cv",
+  number = 5,
+  classProbs = TRUE,       
+  summaryFunction = defaultSummary,  
+  savePredictions = "final",
+  verboseIter = FALSE
+)
+
+
+# 2. Model names:
+# Logistic Regression -> glm 
+# Decision Tree -> rpart
+# Random Forest -> rf
+# Gradient Boosting -> gbm
+# SVM -> svmRadial 
+# k-NN -> knn
+# Naive Bayes -> nb
+
+models_to_run <- c("glm", "rpart", "rf", "gbm", "svmRadial", "knn", "nb")
+results_cv <- list()
+
+# 3. Run cross-validation
+if (requireNamespace("doParallel", quietly = TRUE)) {
+  cl <- makePSOCKcluster(detectCores() - 1)
+  registerDoParallel(cl)
+}
+
+# Train models
+for (model_name in models_to_run) {
+  cat(paste("Training model:", model_name, "...\n"))
+  
+  # Rpart's parameters
+  if (model_name == "rpart") {
+    tune_grid <- expand.grid(cp = seq(0.01, 0.1, 0.01))
+  } else {
+    tune_grid <- NULL # using default
+  }
+  
+  model_fit <- train(
+    Diagnosis ~ .,
+    data = train_data,
+    method = model_name,
+    trControl = control,
+    metric = "Accuracy", 
+    tuneGrid = tune_grid
+  )
+  
+  results_cv[[model_name]] <- model_fit
+  
+  print(model_fit$results[order(model_fit$results$Accuracy, decreasing = TRUE), ][1, ])
+}
+
+if (exists("cl")) {
+  stopCluster(cl)
+  registerDoSEQ()
+}
+
+# 4. Summarize and select best models
+results_summary <- data.frame(
+    Model = character(),
+    CV_Accuracy_Mean = numeric(),
+    CV_Accuracy_Std = numeric(), 
+    stringsAsFactors = FALSE
+)
+
+for (name in names(results_cv)) {
+    best_tune <- results_cv[[name]]$results[order(results_cv[[name]]$results$Accuracy, decreasing = TRUE), ][1, ]
+    results_summary <- results_summary %>%
+        add_row(
+            Model = name,
+            CV_Accuracy_Mean = best_tune$Accuracy,
+            CV_Accuracy_Std = best_tune$AccuracySD 
+        )
+}
+
+# 3. Print
+print("=== Cross-Validation Results ===")
+print(results_summary)
+
+# 4. Model selection
+best_model_name <- results_summary$Model[which.max(results_summary$CV_Accuracy_Mean)]
+best_model <- results_cv[[best_model_name]]
+cat(paste("\nBest model:", best_model_name, "with mean CV Accuracy=",
+          max(results_summary$CV_Accuracy_Mean), "\n"))
+
+```
+
+```{r}
+# 1. Evaluation on testing set
+test_results_list <- list()
+
+for (model_name in names(results_cv)) {
+  model_fit <- results_cv[[model_name]]
+  
+  # Prediction
+  y_pred <- predict(model_fit, newdata = test_data)
+  
+  # Confusion matrix
+  cm <- confusionMatrix(y_pred, test_data$Diagnosis, positive = "Cancer")
+  
+  # Metrics
+  acc <- cm$overall['Accuracy']
+  prec <- cm$byClass['Pos Pred Value'] # Precision
+  rec <- cm$byClass['Recall']         # Recall
+  f1 <- cm$byClass['F1']
+  
+  test_results_list[[model_name]] <- data.frame(
+    Model = model_name,
+    Test_Accuracy = acc,
+    Test_Precision = prec,
+    Test_Recall = rec,
+    Test_F1 = f1
+  )
+  
+  if (model_name == best_model_name) {
+    cat(paste("\n=== Confusion Matrix -", model_name, "===\n"))
+    print(cm$table)
+    
+    # Visualize the confusion matrix
+    cm_df <- as.data.frame(cm$table)
+    
+    ggplot(cm_df, aes(x = Prediction, y = Reference, fill = Freq)) +
+      geom_tile(color = "white") +
+      scale_fill_gradient(low = "white", high = "#336699") +
+      geom_text(aes(label = Freq), vjust = 1, fontface = "bold", size = 5) +
+      labs(title = paste("Confusion Matrix -", model_name),
+           x = "Predicted Label", y = "True Label") +
+      theme_minimal() +
+      theme(plot.title = element_text(face = "bold", size = 14), legend.position = "none")
+  }
+}
+
+# 2. Test result summary
+test_results_df <- do.call(rbind, test_results_list)
+
+print("\n=== Test Set Results ===")
+print(test_results_df)
+```
+
+```{r}
+library(dplyr)
+
+df %>%
+  group_by(Diagnosis) %>%
+  summarise(
+    Count = n(),
+    Percentage = n() / nrow(df) * 100
+  ) %>%
+  ungroup() %>%
+  mutate(
+    Percentage_Formatted = paste0(round(Percentage, 2), "%")
+  )
+```
+
+## Stacked model
+```{r}
+set.seed(42)
+
+K <- 5
+folds <- createFolds(train_data$Diagnosis, k = K, list = TRUE)
+
+# Store OOF stacking features
+oof_rf_prob  <- rep(NA, nrow(train_data))
+oof_gbm_prob <- rep(NA, nrow(train_data))
+
+# 5-fold stacking
+for (i in 1:K) {
+  cat("Processing fold", i, "\n")
+  
+  idx_valid <- folds[[i]]
+  idx_train <- setdiff(seq_len(nrow(train_data)), idx_valid)
+  
+  train_fold <- train_data[idx_train, ]
+  valid_fold <- train_data[idx_valid, ]
+  
+  # RF
+  rf_model <- train(
+    Diagnosis ~ ., data = train_fold, method = "rf",
+    trControl = trainControl(method = "cv", number = 3),
+    tuneLength = 5
+  )
+  
+  # GBM
+  gbm_model <- train(
+    Diagnosis ~ ., data = train_fold, method = "gbm",
+    trControl = trainControl(method = "cv", number = 3),
+    verbose = FALSE
+  )
+  
+  # OOF predictions
+  oof_rf_prob[idx_valid]  <- predict(rf_model,  valid_fold, type = "prob")[, "Cancer"]
+  oof_gbm_prob[idx_valid] <- predict(gbm_model, valid_fold, type = "prob")[, "Cancer"]
+}
+
+# Generate stacked features without data leakage
+stacked_train <- data.frame(
+  rf_prob  = oof_rf_prob,
+  gbm_prob = oof_gbm_prob,
+  y = as.numeric(train_data$Diagnosis == "Cancer")
+)
+
+```
+
+### Check 2 base models' contributions
+```{r}
+library(glmnet)
+X_stack <- as.matrix(stacked_train[, c("rf_prob", "gbm_prob")])
+y_stack <- stacked_train$y
+
+stack_lr <- cv.glmnet(
+  X_stack, y_stack,
+  family = "binomial",
+  alpha = 1,       # LASSO: prevent over fitting
+  nfolds = 5
+)
+
+cat("Selected lambda:", stack_lr$lambda.min, "\n")
+coef(stack_lr, s = "lambda.min")
+```
+
+### Train stacked model
+```{r}
+rf_full <- train(
+  Diagnosis ~ ., data = train_data, method = "rf",
+  trControl = trainControl(method = "none"),
+  tuneGrid = data.frame(mtry = floor(sqrt(ncol(train_data) - 1))),
+  ntree = 500
+)
+
+gbm_full <- train(
+  Diagnosis ~ ., data = train_data, method = "gbm",
+  trControl = trainControl(method = "none"),
+  verbose = FALSE,
+  tuneGrid = data.frame(
+    n.trees = 200,
+    interaction.depth = 3,
+    shrinkage = 0.05,
+    n.minobsinnode = 10
+  )
+)
+
+rf_test_prob  <- predict(rf_full, newdata = test_data, type = "prob")[, "Cancer"]
+gbm_test_prob <- predict(gbm_full, newdata = test_data, type = "prob")[, "Cancer"]
+
+stacked_test <- as.matrix(data.frame(
+  rf_prob  = rf_test_prob,
+  gbm_prob = gbm_test_prob
+))
+
+final_probs <- predict(stack_lr, newx = stacked_test, s = "lambda.min", type = "response")
+final_pred  <- ifelse(final_probs > 0.5, "Cancer", "NoCancer")
+final_pred  <- factor(final_pred, levels = c("NoCancer","Cancer"))
+```
+
+### Stacked model result
+```{r}
+# Confusion Matrix
+confusionMatrix(final_pred, test_data$Diagnosis)
+
+train_pred <- predict(stack_lr, newx = X_stack, s = "lambda.min", type = "response")
+# Convert matrix into vector
+train_pred_vector <- as.numeric(train_pred[, 1])  # 提取第一列并转为 numeric 向量
+final_probs_vector <- as.numeric(final_probs[, 1])
+
+# ROC curve
+roc_curve <- roc(test_data$Diagnosis, final_probs_vector)
+auc(roc_curve)
+
+library(MLmetrics)
+# Convert factor into numeric (1 = Cancer, 0 = NoCancer)
+y_true <- ifelse(test_data$Diagnosis == "Cancer", 1, 0)
+y_pred <- ifelse(final_pred == "Cancer", 1, 0)
+
+Precision <- Precision(y_pred, y_true)
+Recall    <- Recall(y_pred, y_true)
+F1        <- F1_Score(y_pred, y_true)
+
+cat("Precision:", Precision, "\n")
+cat("Recall:", Recall, "\n")
+cat("F1 Score:", F1, "\n")
+```
+
+## Evaluation of stacked model
+### (i) Over-fitting
+```{r}
+# (i) Evaluate over fitting
+train_pred <- predict(stack_lr, newx = X_stack, s = "lambda.min", type = "response")
+
+auc_train <- auc(roc(train_data$Diagnosis, train_pred_vector))
+auc_test  <- auc(roc(test_data$Diagnosis, final_probs_vector))
+
+cat("Train AUC:", auc_train, "\n")
+cat("Test  AUC:", auc_test, "\n")
+cat("Gap =", auc_train - auc_test, "\n")
+```
+
+### Visualize the ROC curve
+```{r}
+# 1. Get baseline logistic regression prediction probabilities
+glm_model <- results_cv[["glm"]]
+glm_test_probs <- predict(glm_model, newdata = test_data, type = "prob")[, "Cancer"]
+
+# 2. Generate the baseline logistic regression's ROC curve
+roc_glm <- roc(test_data$Diagnosis, glm_test_probs)
+
+# Plot
+# Plot Stacked Train ROC
+plot(roc(train_data$Diagnosis, train_pred_vector), 
+     col = "blue", 
+     main = "Stacked vs. Logistic Regression ROC Comparison",
+     xlab = "False Positive Rate (1 - Specificity)",
+     ylab = "True Positive Rate (Sensitivity)") 
+
+# Add Stacked Test ROC
+plot(roc(test_data$Diagnosis, final_probs_vector), 
+     col = "red", 
+     add = TRUE)
+
+# Add GLM Test ROC
+plot(roc_glm, 
+     col = "purple", 
+     add = TRUE)
+
+# 4. Add random prediction line
+abline(a = 0, b = 1, lty = 2, col = "gray")
+
+legend("bottomright", 
+       legend = c(
+         paste("Stacked Train AUC:", round(auc(roc(train_data$Diagnosis, train_pred_vector)), 4)),
+         paste("Stacked Test AUC:", round(auc(roc(test_data$Diagnosis, final_probs_vector)), 4)),
+         paste("Logistic Regression Test AUC:", round(auc(roc_glm), 4))
+       ),
+       col = c("blue", "red", "purple"), 
+       lwd = 2)
+
+cat("\nLogistic Regression Test AUC:", auc(roc_glm), "\n")
+```
+
+### (ii) Stratified split
+```{r}
+# (ii) Evaluate the stratified split
+prop.table(table(train_data$Diagnosis))
+prop.table(table(test_data$Diagnosis))
+```
+
+### Visualize the splitting size
+```{r}
+library(ggplot2)
+
+ggplot(train_data, aes(x = Diagnosis)) +
+  geom_bar(aes(y = (..count..)/sum(..count..)), fill = "steelblue") +
+  geom_text(aes(y = (..count..)/sum(..count..), label = scales::percent((..count..)/sum(..count..))),
+            stat = "count", vjust = -0.5) +
+  ylab("Proportion") +
+  ggtitle("Training Set Class Distribution") +
+  theme_minimal()
+
+ggplot(test_data, aes(x = Diagnosis)) +
+  geom_bar(aes(y = (..count..)/sum(..count..)), fill = "steelblue") +
+  geom_text(aes(y = (..count..)/sum(..count..), label = scales::percent((..count..)/sum(..count..))),
+            stat = "count", vjust = -0.5) +
+  ylab("Proportion") +
+  ggtitle("Testing Set Class Distribution") +
+  theme_minimal()
+```
+
+### (iii) Calibration plot
+```{r}
+# 3. (iii) Calibration Plot
+# Create data frame
+df_calib <- data.frame(
+  prob = final_probs_vector,
+  true = y_true
+)
+
+# 2. Split the prediction probabilities into different classes
+n_bins <- 6
+df_calib$bin <- cut(df_calib$prob, breaks = seq(0,1,length.out = n_bins+1), include.lowest = TRUE)
+
+calib_summary <- df_calib %>%
+  group_by(bin) %>%
+  summarise(
+    mean_pred = mean(prob),
+    obs_rate  = mean(true),
+    n         = n()
+  )
+
+# 3. Plot the calibration plot
+ggplot(calib_summary, aes(x = mean_pred, y = obs_rate)) +
+  geom_point(aes(size = n), color = "blue") +           
+  geom_line(color = "blue") +
+  geom_text(aes(label = n), vjust = -1.5, hjust = 0.5, size = 3.5, color = "black") +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "red") +
+  xlim(0, 1) + ylim(0, 1) +
+  xlab("Mean Predicted Probability") +
+  ylab("Observed Event Rate") +
+  ggtitle("Stacked Logistic Regression Calibration Plot") +
+  theme_minimal() +
+  scale_size_continuous(name = "Samples per bin")
+
+# 4. Calculate Brier Score
+brier_score <- mean((final_probs_vector - y_true)^2)
+cat("Brier Score:", round(brier_score, 4), "\n")
+```
+
+### (iv) Feature importance and stacked model's interpretability
+```{r}
+# (iv) Evaluate feature importance / Explainability
+# rf feature importance score
+rf_imp <- varImp(rf_full)$importance
+rf_imp %>% arrange(desc(Overall)) 
+
+# GBM feature importance score
+gbm_imp <- summary(gbm_full$finalModel, n.trees = gbm_full$bestTune$n.trees, plotit = FALSE)
+print(gbm_imp)
+
+coef(stack_lr, s = "lambda.min")  # base models' contributions
+```
+
+```{r}
+library(dplyr)
+library(tidyr)
+
+rf_data <- data.frame(
+  Feature = c("CancerHistoryYes", "BMI", "AlcoholIntake", "GeneticRiskHigh", "PhysicalActivity", 
+              "Age", "GenderFemale", "SmokingYes", "GeneticRiskMedium"),
+  RF_Importance = c(100.00, 83.93, 80.48, 79.50, 75.92, 74.19, 42.45, 26.35, 0.00)
+)
+
+gbm_data <- data.frame(
+  Feature = c("CancerHistoryYes", "GeneticRiskHigh", "AlcoholIntake", "GenderFemale", "BMI", 
+              "PhysicalActivity", "Age", "SmokingYes", "GeneticRiskMedium"),
+  GBM_Importance = c(20.91, 17.86, 11.10, 10.91, 10.69, 10.60, 10.52, 7.34, 0.08)
+)
+
+# Combine feature importance from two models into one table
+combined_imp <- full_join(rf_data, gbm_data, by = "Feature") %>%
+  mutate(
+    Feature_Clean = case_when(
+      grepl("CancerHistory", Feature) ~ "Cancer History (Yes)",
+      grepl("GeneticRiskHigh", Feature) ~ "Genetic Risk (High)",
+      grepl("GenderFemale", Feature) ~ "Gender (Female)",
+      grepl("SmokingYes", Feature) ~ "Smoking (Yes)",
+      grepl("GeneticRiskMedium", Feature) ~ "Genetic Risk (Medium)",
+      TRUE ~ Feature # 保留其他变量原名
+    )
+  ) %>%
+  select(Feature_Clean, RF_Importance, GBM_Importance) %>%
+  arrange(desc(RF_Importance)) 
+
+print(combined_imp)
+```
+
+### Stacked model interpretability
+```{r}
+# Define a function to calculate stacked model's final prediction probability
+stacked_predict_prob <- function(object, newdata) {
+  # 1. Base Learner Predictions
+  rf_test_prob <- predict(rf_full, newdata = newdata, type = "prob")[, "Cancer"]
+  gbm_test_prob <- predict(gbm_full, newdata = newdata, type = "prob")[, "Cancer"]
+# Sanity Check 1: Check base learner's prediction length
+  if (length(rf_test_prob) != nrow(newdata) || length(gbm_test_prob) != nrow(newdata)) {
+  warning("Sanity Check Failed: Base Learner prediction length does not match input data rows. Check for    
+  NA/missing rows due to new factor levels.")
+}
+  # 2. Create stacked feature matrix (Level 1)
+  if (any(is.na(rf_test_prob)) || any(is.na(gbm_test_prob))) {
+  warning("Sanity Check Failed: Base Learner probabilities contain NA values.")
+}
+  stacked_test <- as.matrix(data.frame(
+    rf_prob  = rf_test_prob,
+    gbm_prob = gbm_test_prob
+  ))
+  
+  # 3. Final prediction using Meta learner
+  final_probs <- predict(stack_lr, newx = stacked_test, s = "lambda.min", type = "response")
+  # Sanity Check 2: Check final prediction probabilities
+  if (any(final_probs < 0) || any(final_probs > 1) || any(is.na(final_probs))) {
+  warning("Sanity Check Failed: Final probabilities contain values outside [0, 1] or contain NA.")
+  # stop("Invalid probability detected.")
+}
+  # Return prediction probability vector
+  return(as.numeric(final_probs))
+}
+```
+
+```{r}
+library(iml)
+library(ggplot2)
+library(dplyr)
+
+predictor_stacked <- Predictor$new(
+  # model = rf_full, # take this space
+  data = train_data[,-which(names(train_data)=="Diagnosis")],
+  y = train_data$Diagnosis,
+  predict.function = stacked_predict_prob, 
+  class = "Cancer" 
+)
+
+# --- 2. Select sample we want to interpret (testing set's 50th sample) ---
+x_interest_test_sample <- test_data[50, -which(names(test_data)=="Diagnosis")]
+
+# --- 3. Calculate stacked model's SHAP value ---
+shapley_stacked <- Shapley$new(
+  predictor = predictor_stacked,
+  x.interest = x_interest_test_sample
+)
+
+# --- 4. Plot ---
+shapley_stacked$plot()
+
+shap_df <- shapley_stacked$results %>%
+  arrange(abs(phi))   
+
+ggplot(shap_df, aes(x = reorder(feature.value, phi), y = phi, fill = phi)) +
+  geom_col() +
+  coord_flip() +
+  scale_fill_gradient2(
+    low = "blue",
+    mid = "white",
+    high = "red",
+    midpoint = 0
+  ) +
+  labs(
+    title = "SHAP Values for Stacked Model",
+    x = "Feature",
+    y = "SHAP Contribution"
+  ) +
+  theme_minimal(base_size = 14)
+
+```
+
+```{r}
+# Sanity check for stacked_predict_prob
+# 1. Create a testing df
+test_data_sample <- train_data[1:10, -which(names(train_data) == "Diagnosis")]
+
+# 2. Run stacked_predict_prob
+test_probs <- stacked_predict_prob(object = rf_full, newdata = test_data_sample)
+
+# 3. Check max and min
+max_prob <- max(test_probs, na.rm = TRUE)
+min_prob <- min(test_probs, na.rm = TRUE)
+
+print(paste("Maximum calculated probability:", max_prob))
+print(paste("Minimum calculated probability:", min_prob))
+```
+
+### Visualize examples of covariate's non-linear trend
+```{r}
+library(iml)
+library(ggplot2)
+# Validated that our stacked logistic regression has learned non-linear relationship
+# BMI plot
+effect_bmi <- FeatureEffect$new(
+    predictor = predictor_stacked, 
+    feature = "BMI", 
+    method = "pdp"
+)
+
+plot_pdp_bmi <- effect_bmi$plot() + 
+    labs(title = "Stacked Model PDP (BMI)", 
+         y = "Predicted Cancer Probability (0-1)") +
+    theme_minimal()
+
+print(plot_pdp_bmi)
+
+# AlcholIntake plot
+effect_alch <- FeatureEffect$new(
+    predictor = predictor_stacked, 
+    feature = "AlcoholIntake", 
+    method = "pdp"
+)
+
+plot_pdp_alch <- effect_alch$plot() + 
+    labs(title = "Stacked Model PDP (AlcoholIntake)", 
+         y = "Predicted Cancer Probability (0-1)") +
+    theme_minimal()
+
+print(plot_pdp_alch)
+```
+
+### (v) Deviance and QQ-plot as diagnosis
+```{r}
+# (v) Deviance and QQ-plot as diagnosis
+X_train_stack <- as.matrix(data.frame(
+  rf_prob  = predict(rf_full, newdata = train_data, type = "prob")[, "Cancer"],
+  gbm_prob = predict(gbm_full, newdata = train_data, type = "prob")[, "Cancer"]
+))
+y_train <- ifelse(train_data$Diagnosis == "Cancer", 1, 0)
+
+train_pred_prob <- as.vector(predict(stack_lr, newx = X_train_stack, s = "lambda.min", type = "response"))
+
+# Deviance residuals
+dev_resid <- ifelse(y_train == 1,
+                    sqrt(-2 * log(train_pred_prob)),
+                    -sqrt(-2 * log(1 - train_pred_prob)))
+
+# Standardized residuals
+std_resid <- scale(dev_resid)
+
+# Residuals vs Fitted plot
+residual_data <- data.frame(Fitted = train_pred_prob, DevianceResid = dev_resid)
+
+plot_resid_fitted <- ggplot(residual_data, aes(x = Fitted, y = DevianceResid)) +
+  geom_point(alpha = 0.5, color = "#1E88E5") +
+  geom_smooth(method = "loess", color = "darkorange", se = FALSE, linetype = "solid") + 
+  geom_hline(yintercept = 0, color = "red", linetype = "dashed", size = 1) +
+  labs(title = "Stacked Model: Deviance Residuals vs Fitted Probabilities",
+       x = "Fitted Probabilities",
+       y = "Deviance Residuals") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+
+print(plot_resid_fitted)
+
+
+# Q-Q plot 
+qq_data <- data.frame(StdResid = std_resid)
+
+plot_qq <- ggplot(qq_data, aes(sample = StdResid)) +
+  stat_qq(alpha = 0.6, color = "#2E7D32") + # 绿色散点
+  stat_qq_line(color = "red", linetype = "dashed", size = 1) +
+  labs(title = "Stacked Model: Q-Q Plot of Standardized Deviance Residuals",
+       x = "Theoretical Quantiles",
+       y = "Sample Quantiles") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+
+print(plot_qq)
+```
+
+## Fine tuning
+```{r}
+rf_tune <- train(
+  Diagnosis ~ ., data = train_data, method = "rf",
+  trControl = trainControl(method = "cv", number = 5, verboseIter = TRUE), # 使用 5 折交叉验证
+  tuneGrid = data.frame(mtry = c(2, 4, 6, 8)), # 尝试不同的 mtry 值
+  ntree = 500
+)
+
+gbm_tune <- train(
+  Diagnosis ~ ., data = train_data, method = "gbm",
+  trControl = trainControl(method = "cv", number = 5, verboseIter = TRUE),
+  verbose = FALSE,
+  tuneGrid = expand.grid( # 尝试多种参数组合
+    n.trees = c(300, 500),
+    interaction.depth = c(3, 5),
+    shrinkage = c(0.1, 0.05),
+    n.minobsinnode = 10
+  )
+)
+
+# Find best hyperparameters
+best_mtry <- rf_tune$bestTune$mtry
+best_n.trees <- gbm_tune$bestTune$n.trees 
+```
+
+```{r}
+# --- 1. Set best hyperparameters ---
+best_mtry <- 4
+best_n.trees <- 300
+best_depth <- 3
+best_shrinkage <- 0.05
+
+# --- 2. Train rf base learner (tuned) ---
+rf_full_tuned <- train(
+  Diagnosis ~ ., data = train_data, method = "rf",
+  trControl = trainControl(method = "none"), 
+  tuneGrid = data.frame(mtry = best_mtry),  
+  ntree = 500
+)
+
+# --- 3. Train gbm base learner (tuned) ---
+gbm_full_tuned <- train(
+  Diagnosis ~ ., data = train_data, method = "gbm",
+  trControl = trainControl(method = "none"),
+  verbose = FALSE,
+  tuneGrid = data.frame(
+    n.trees = best_n.trees,        
+    interaction.depth = best_depth,  
+    shrinkage = best_shrinkage,      
+    n.minobsinnode = 10
+  )
+)
+
+X_train_tuned <- as.matrix(data.frame(
+  rf_prob  = predict(rf_full_tuned, newdata = train_data, type = "prob")[, "Cancer"],
+  gbm_prob = predict(gbm_full_tuned, newdata = train_data, type = "prob")[, "Cancer"]
+))
+y_train <- ifelse(train_data$Diagnosis == "Cancer", 1, 0)
+
+# --- 4. Train stacked model (tuned)
+stacked_lr_tuned <- cv.glmnet(
+  X_train_tuned, y_train,
+  family = "binomial",
+  alpha = 1, # LASSO
+  nfolds = 5
+)
+```
+
+```{r}
+# --- 1. Prepare Level 1's feature matrix for testing set ---
+X_test_tuned <- as.matrix(data.frame(
+  rf_prob  = predict(rf_full_tuned, newdata = test_data, type = "prob")[, "Cancer"],
+  gbm_prob = predict(gbm_full_tuned, newdata = test_data, type = "prob")[, "Cancer"]
+))
+y_test <- ifelse(test_data$Diagnosis == "Cancer", 1, 0)
+
+# --- 2. Get stacked model prediction probability from fine tuned base models ---
+train_pred_tuned <- as.vector(predict(stacked_lr_tuned, newx = X_train_tuned, s = "lambda.min", type = "response"))
+final_probs_tuned <- as.vector(predict(stacked_lr_tuned, newx = X_test_tuned, s = "lambda.min", type = "response"))
+
+# --- 3. Calculate AUC ---
+auc_train_tuned <- auc(roc(train_data$Diagnosis, train_pred_tuned, quiet = TRUE))
+auc_test_tuned  <- auc(roc(test_data$Diagnosis, final_probs_tuned, quiet = TRUE))
+
+# --- 4. Original AUC ---
+auc_train_original <- auc_train  
+auc_test_original  <- auc_test   
+
+
+# AUC comparison
+cat("Comparison of original stacked model vs fined tuned stacked model\n")
+cat("Training set's AUC improvement: \n")
+cat("Original stacked model's AUC:", round(auc_train_original, 4), "\n")
+cat("Fine tuned stacked modal's AUC:", round(auc_train_tuned, 4), "\n")
+cat("Change in AUC:", round(auc_train_tuned - auc_train_original, 4), "\n\n")
+
+cat("Testing set's AUC improvement: \n")
+cat("Original stacked model's AUC:", round(auc_test_original, 4), "\n")
+cat("Fine tuned stacked modal's AUC:", round(auc_test_tuned, 4), "\n")
+cat("Change in AUC:", round(auc_test_tuned - auc_test_original, 4), "\n")
+```
+
+### Fine tuned stacked model diagnosis
+```{r}
+library(ggplot2)
+
+# --- 1. Calculate fine tuned stacked model's prediction on training set ---
+pred_prob_train_tuned <- as.vector(
+    predict(stacked_lr_tuned, newx = X_train_tuned, s = "lambda.min", type = "response")
+)
+
+# --- 2. Calculate the deviance residual and standardized residual ---
+y_train_binary <- y_train 
+
+dev_resid_tuned <- ifelse(y_train_binary == 1,
+                          sqrt(-2 * log(pred_prob_train_tuned)),
+                          -sqrt(-2 * log(1 - pred_prob_train_tuned)))
+std_resid_tuned <- scale(dev_resid_tuned)
+
+# --- 3. Plot Deviance Residuals vs Fitted Plot ---
+resid_data_tuned <- data.frame(
+  Fitted = pred_prob_train_tuned, 
+  DevianceResid = dev_resid_tuned
+)
+
+ggplot(resid_data_tuned, aes(x = Fitted, y = DevianceResid)) +
+  geom_point(alpha = 0.5, color = "#1E88E5") +
+  geom_smooth(method = "loess", se = FALSE, color = "darkorange", linewidth = 1.2) +
+  geom_hline(yintercept = 0, color = "red", linetype = "dashed") +
+  labs(
+    title = "Fine Tuned Stacked Model: Deviance Residuals vs Fitted Probabilities",
+    x = "Fitted Probability",
+    y = "Deviance Residuals"
+  ) +
+  theme_minimal()
+
+
+# --- 4. Q-Q Plot ---
+ggplot(data.frame(StdResid = std_resid_tuned), aes(sample = StdResid)) +
+  stat_qq(alpha = 0.7, color = "#2E7D32") +
+  stat_qq_line(color = "red", linetype = "solid") +
+  labs(
+    title = "Fine Tuned Stacked Model: Q-Q Plot of Standardized Deviance Residuals",
+    x = "Theoretical Quantiles",
+    y = "Sample Quantiles"
+  ) +
+  theme_minimal()
+```
